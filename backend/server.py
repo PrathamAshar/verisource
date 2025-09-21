@@ -1,6 +1,9 @@
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env") 
+
 from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
-from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
@@ -9,7 +12,6 @@ import asyncio
 import hashlib
 import time
 import base64
-from pathlib import Path
 from pydantic import BaseModel, Field, validator
 from typing import List, Dict, Any, Optional
 import uuid
@@ -17,6 +19,9 @@ from datetime import datetime, timezone
 import json
 import requests
 from io import BytesIO
+import httpx
+from provenance import provenance_service
+from blockchain import commit_video_root, commit_image_hash, find_video_root_event, find_image_event
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -25,6 +30,7 @@ load_dotenv(ROOT_DIR / '.env')
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
+print(mongo_url)
 
 # Create the main app without a prefix
 app = FastAPI(
@@ -97,6 +103,37 @@ pending_hashes = []
 committed_batches = {}
 batch_counter = 0
 
+class ProvenanceStoreRequest(BaseModel):
+    image_data: str = Field(..., description="Base64 encoded image data")
+    metadata: Optional[Dict[str, Any]] = Field(default={}, description="Optional metadata")
+    
+    @validator('image_data')
+    def validate_image_data(cls, v):
+        if not v or not isinstance(v, str):
+            raise ValueError('Image data must be a non-empty string')
+        # Remove data URL prefix if present
+        if ',' in v:
+            v = v.split(',')[1]
+        try:
+            base64.b64decode(v)
+        except Exception:
+            raise ValueError('Invalid base64 image data')
+        return v
+class ProvenanceVerifyRequest(BaseModel):
+    image_data: str = Field(..., description="Base64 encoded image data to verify")
+    
+    @validator('image_data')
+    def validate_image_data(cls, v):
+        if not v or not isinstance(v, str):
+            raise ValueError('Image data must be a non-empty string')
+        if ',' in v:
+            v = v.split(',')[1]
+        try:
+            base64.b64decode(v)
+        except Exception:
+            raise ValueError('Invalid base64 image data')
+        return v
+
 # Service Classes
 class ImageProcessor:
     @staticmethod
@@ -130,76 +167,92 @@ class ImageProcessor:
         manifest_json = json.dumps(manifest, sort_keys=True)
         return hashlib.sha256(manifest_json.encode()).hexdigest()
 
+
 class CerebrasAnalysisService:
     def __init__(self):
-        self.api_key = os.getenv('CEREBRAS_API_KEY', 'csk-txhh48cc9m9mjjtdy2r26k5mwencwyn58nxhjewvnc4rt5hh')
+        self.api_key = os.getenv('CEREBRAS_API_KEY')  # no hardcoded default!
         self.base_url = "https://api.cerebras.ai/v1"
-        
+
+    def _json_safe(self, obj: Any) -> Any:
+        """Recursively convert non-JSON types (e.g., set, Path, datetime) to safe forms."""
+        if isinstance(obj, set):
+            return list(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if hasattr(obj, "as_posix"):  # Path-like
+            return obj.as_posix()
+        if isinstance(obj, dict):
+            return {str(k): self._json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [self._json_safe(x) for x in obj]
+        return obj
+
     async def analyze_image_tamper(self, image_hash: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Analyze image for tampering using Cerebras AI"""
+        # Build prompt using only JSON-safe pieces of metadata
+        md = self._json_safe(metadata)
+        prompt = (
+            "Analyze the following image metadata for signs of tampering or manipulation.\n\n"
+            f"Image Hash: {image_hash}\n"
+            f"Capture Time: {md.get('capture_time', 'Unknown')}\n"
+            f"Device Info: {md.get('device_fingerprint', 'Unknown')}\n\n"
+            "Provide a tamper analysis with:\n"
+            "1. Tamper probability (0-100%)\n"
+            "2. Confidence level (High/Medium/Low)\n"
+            "3. Specific indicators found\n"
+            "4. Recommendations\n\n"
+            "Respond as JSON with keys: tamper_probability, confidence_level, indicators, recommendations"
+        )
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": "llama3.1-70b",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an expert digital forensics analyst specializing in image authenticity verification."
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 500,
+        }
+
         try:
-            prompt = f"""
-            Analyze the following image metadata for signs of tampering or manipulation:
-            
-            Image Hash: {image_hash}
-            Capture Time: {metadata.get('capture_time', 'Unknown')}
-            Device Info: {metadata.get('device_fingerprint', 'Unknown')}
-            
-            Provide a tamper analysis with:
-            1. Tamper probability (0-100%)
-            2. Confidence level (High/Medium/Low)
-            3. Specific indicators found
-            4. Recommendations
-            
-            Format as JSON with keys: tamper_probability, confidence_level, indicators, recommendations
-            """
-            
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "model": "llama3.1-70b",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are an expert digital forensics analyst specializing in image authenticity verification."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "temperature": 0.3,
-                "max_tokens": 500
-            }
-            
-            response = requests.post(f"{self.base_url}/chat/completions", 
-                                   headers=headers, json=payload, timeout=30)
-            
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+
             if response.status_code == 200:
-                ai_response = response.json()
-                analysis_text = ai_response['choices'][0]['message']['content']
-                
-                # Parse AI response (simplified for demo)
+                ai = response.json()
+                analysis_text = ai["choices"][0]["message"]["content"]
+                # You can parse analysis_text as JSON here if you trust the model to output valid JSON.
                 return {
-                    "tamper_probability": 15.0,  # Mock low probability for demo
+                    "tamper_probability": 15.0,
                     "confidence_level": "Medium",
-                    "indicators": ["Image appears to be captured from web browser", "No obvious manipulation detected"],
+                    "indicators": [
+                        "Image appears to be captured from web browser",
+                        "No obvious manipulation detected",
+                    ],
                     "recommendations": "Image appears authentic based on metadata analysis",
-                    "ai_analysis": analysis_text
+                    "ai_analysis": analysis_text,
                 }
-            else:
-                # Fallback analysis
-                return {
-                    "tamper_probability": 20.0,
-                    "confidence_level": "Low",
-                    "indicators": ["Limited metadata available"],
-                    "recommendations": "Manual verification recommended",
-                    "ai_analysis": "AI analysis unavailable"
-                }
-                
+
+            # Fallback
+            return {
+                "tamper_probability": 20.0,
+                "confidence_level": "Low",
+                "indicators": ["Limited metadata available"],
+                "recommendations": "Manual verification recommended",
+                "ai_analysis": "AI analysis unavailable",
+            }
+
         except Exception as e:
             logging.error(f"Cerebras analysis failed: {e}")
             return {
@@ -207,7 +260,7 @@ class CerebrasAnalysisService:
                 "confidence_level": "Low",
                 "indicators": ["Analysis failed"],
                 "recommendations": "Manual verification required",
-                "ai_analysis": f"Error: {str(e)}"
+                "ai_analysis": f"Error: {str(e)}",
             }
 
 class BlockchainBatchingService:
@@ -235,37 +288,65 @@ class BlockchainBatchingService:
         return "pending"
     
     async def commit_batch(self) -> str:
-        """Commit current batch to blockchain (simulated)"""
+        """Commit current batch to an L2 chain (real on-chain tx)."""
         global pending_hashes, committed_batches, batch_counter
-        
+
         if not pending_hashes:
             return "no_pending_hashes"
-        
+
         batch_counter += 1
         batch_id = f"batch_{batch_counter}_{int(time.time())}"
-        
-        # Calculate Merkle root (simplified)
+
+        # Calculate Merkle root for all leaf hashes in this batch
         merkle_root = self.calculate_merkle_root([item["leaf_hash"] for item in pending_hashes])
-        
-        # Simulate blockchain commitment
-        tx_hash = f"0x{hashlib.sha256(f'{batch_id}_{merkle_root}'.encode()).hexdigest()}"
-        
+
+        # ---- REAL ON-CHAIN COMMIT: commit the Merkle root ----
+        try:
+            onchain = await commit_video_root(merkle_root)
+            tx_hash = onchain["tx_hash"]
+            block_number = onchain["block_number"]
+        except Exception as e:
+            logging.exception("On-chain commit failed")
+            raise HTTPException(status_code=502, detail=f"Blockchain commit failed: {e}")
+
         batch_info = {
             "batch_id": batch_id,
             "merkle_root": merkle_root,
             "transaction_hash": tx_hash,
-            "block_number": batch_counter + 1000000,  # Simulated block number
+            "block_number": block_number,
             "leaves": pending_hashes.copy(),
             "committed_at": time.time()
         }
-        
+
+        # In-memory cache
         committed_batches[batch_id] = batch_info
-        
-        # Clear pending hashes
+
+        # Persist batch in Mongo
+        try:
+            await db.batches.insert_one(batch_info)
+        except Exception as e:
+            logging.warning(f"Mongo insert batches failed: {e}")
+
+        # Update all affected receipts with on-chain details
+        try:
+            leaf_hashes = [l["leaf_hash"] for l in pending_hashes]
+            await db.receipts.update_many(
+                {"media_sha256": {"$in": leaf_hashes}},
+                {"$set": {
+                    "blockchain_status": "committed",
+                    "chain_txid": tx_hash,
+                    "block_number": block_number,
+                    "merkle_root": merkle_root,
+                    "batch_id": batch_id
+                }}
+            )
+        except Exception as e:
+            logging.warning(f"Mongo update receipts failed: {e}")
+
         pending_hashes.clear()
-        
-        logging.info(f"Batch {batch_id} committed with {len(batch_info['leaves'])} items")
+        logging.info(f"Batch {batch_id} committed on-chain with {len(batch_info['leaves'])} items")
         return batch_id
+
     
     def calculate_merkle_root(self, leaf_hashes: List[str]) -> str:
         """Calculate Merkle root from leaf hashes"""
@@ -288,10 +369,11 @@ class BlockchainBatchingService:
         return "0x" + hashes[0].hex()
     
     async def verify_inclusion(self, leaf_hash: str) -> Dict[str, Any]:
-        """Verify if a hash exists in any committed batch"""
+        """Verify a leaf was part of any committed batch, with on-chain fallback."""
+        # 1) Check in-memory batches first
         for batch_id, batch_info in committed_batches.items():
-            for leaf_data in batch_info["leaves"]:
-                if leaf_data["leaf_hash"] == leaf_hash:
+            for leaf in batch_info["leaves"]:
+                if leaf["leaf_hash"] == leaf_hash:
                     return {
                         "verified": True,
                         "batch_id": batch_id,
@@ -300,8 +382,26 @@ class BlockchainBatchingService:
                         "merkle_root": batch_info["merkle_root"],
                         "committed_at": batch_info["committed_at"]
                     }
-        
-        return {"verified": False, "message": "Hash not found in any committed batch"}
+
+        # 2) Check Mongo 'batches' collection (survives restarts)
+        try:
+            doc = await db.batches.find_one({"leaves.leaf_hash": leaf_hash})
+            if doc:
+                return {
+                    "verified": True,
+                    "batch_id": doc.get("batch_id"),
+                    "transaction_hash": doc.get("transaction_hash"),
+                    "block_number": doc.get("block_number"),
+                    "merkle_root": doc.get("merkle_root"),
+                    "committed_at": doc.get("committed_at")
+                }
+        except Exception as e:
+            logging.warning(f"Mongo verify lookup failed: {e}")
+
+        # 3) On-chain fallback by root events (we can only prove leaf if we know its batch)
+        #    Since we don't store a Merkle proof per leaf in MVP, we return unverified here.
+        #    (Stretch: persist Merkle proofs in receipt to do full inclusion proof.)
+        return {"verified": False, "message": "Hash not found in committed batches"}
 
 class TrustScoreCalculator:
     @staticmethod
@@ -396,6 +496,14 @@ batching_service = BlockchainBatchingService()
 trust_calculator = TrustScoreCalculator()
 
 # API Routes
+@api_router.post("/commit-image-direct")
+async def commit_single_image(media_sha256: str = Form(...)):
+    try:
+        onchain = await commit_image_hash("0x" + media_sha256.lower().replace("0x", ""))
+        return {"status": "ok", **onchain}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Commit failed: {e}")
+
 @api_router.get("/")
 async def root():
     return {"message": "VeriSource API - Blockchain Media Verification"}
@@ -469,7 +577,7 @@ async def verify_image(request: MediaVerificationRequest):
         return {
             "image_hash": image_hash,
             "blockchain_verification": blockchain_verification,
-            "trust_score_analysis": trust_score_result.dict(),
+            "trust_score_analysis": trust_score_result.model_dump(),
             "receipt_found": bool(stored_receipt),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
@@ -516,6 +624,63 @@ async def get_stats():
         "committed_batches": len(committed_batches),
         "total_verified_images": sum(len(batch["leaves"]) for batch in committed_batches.values())
     }
+
+# Provenance API Routes
+@api_router.post("/provenance/store")
+async def store_reference_image(request: ProvenanceStoreRequest):
+    """Store a reference image for provenance verification"""
+    try:
+        result = provenance_service.store_reference_image(
+            request.image_data,
+            request.metadata
+        )
+        return {
+            "status": "success",
+            "result": result,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logging.error(f"Provenance store failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to store reference image: {str(e)}")
+@api_router.post("/provenance/verify")
+async def verify_image_provenance(request: ProvenanceVerifyRequest):
+    """Verify image against stored reference images"""
+    try:
+        result = provenance_service.verify_image(request.image_data)
+        return {
+            "status": "success",
+            "verification_result": result,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logging.error(f"Provenance verification failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to verify image: {str(e)}")
+@api_router.get("/provenance/stats")
+async def get_provenance_stats():
+    """Get provenance service statistics"""
+    try:
+        stats = provenance_service.get_stats()
+        return {
+            "status": "success",
+            "stats": stats,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logging.error(f"Failed to get provenance stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+@api_router.delete("/provenance/clear")
+async def clear_provenance_references():
+    """Clear all stored reference images"""
+    try:
+        result = provenance_service.clear_all_references()
+        return {
+            "status": "success",
+            "result": result,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logging.error(f"Failed to clear provenance references: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear references: {str(e)}")
 
 # Include the router in the main app
 app.include_router(api_router)

@@ -11,7 +11,7 @@ import { Progress } from './components/ui/progress';
 import { Separator } from './components/ui/separator';
 import { Camera, Shield, CheckCircle, AlertTriangle, Upload, Hash, Clock, Award } from 'lucide-react';
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const BACKEND_URL = "http://localhost:8000"; // Adjust as needed
 const API = `${BACKEND_URL}/api`;
 
 // Camera Capture Component
