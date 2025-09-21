@@ -114,13 +114,11 @@ class ImageProvenanceService:
                 
                 # Get image features
                 image_features = self.model.get_image_features(**inputs)
-
+                
                 # Normalize for cosine similarity
                 image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-
-                # Return as float32 numpy array (FAISS requires float32)
-                emb = image_features.cpu().numpy()
-                return np.asarray(emb, dtype=np.float32).flatten()
+                
+                return image_features.cpu().numpy().flatten()
         except Exception as e:
             logger.error(f"Failed to compute CLIP embedding: {e}")
             raise
@@ -173,29 +171,67 @@ class ImageProvenanceService:
                 img2_gray = img2_np
             
             # Compute SSIM with full=True to get difference map
-            ssim_score, similarity_map = ssim(img1_gray, img2_gray, data_range=255, full=True)
-            diff_image_path = self._generate_diff_visualization(img1_np, img2_np, similarity_map)
-
+            ssim_score, diff_map = ssim(img1_gray, img2_gray, data_range=255, full=True)
+            
+            # Generate difference visualization
+            diff_image_path = self._generate_diff_visualization(img1_np, img2_np, diff_map)
+            
             return float(ssim_score), diff_image_path
             
         except Exception as e:
             logger.error(f"Failed to compute SSIM: {e}")
             return 0.0, None
     
-    def _generate_diff_visualization(self, img1, img2, similarity_map):
-        threshold = 0.90  # pixels below this similarity are "changed"
-        diff_binary = (similarity_map < threshold).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(diff_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        annotated_img = img2.copy()
-        for c in contours:
-            if cv2.contourArea(c) > 100:
-                x,y,w,h = cv2.boundingRect(c)
-                cv2.rectangle(annotated_img, (x,y), (x+w,y+h), (255,0,0), 3)
-        Path("temp_diff").mkdir(exist_ok=True)
-        out = str(Path("temp_diff") / "diff_result.jpg")
-        cv2.imwrite(out, cv2.cvtColor(annotated_img, cv2.COLOR_RGB2BGR))
-        return out
-
+    def _generate_diff_visualization(self, img1: np.ndarray, img2: np.ndarray, diff_map: np.ndarray) -> str:
+        """Generate difference visualization with bounding boxes"""
+        try:
+            # Convert difference map to binary mask
+            # SSIM diff map: 0 = identical, 1 = completely different
+            threshold = 0.1  # Adjust threshold as needed
+            diff_binary = (diff_map > threshold).astype(np.uint8) * 255
+            
+            # Find contours of changed regions
+            contours, _ = cv2.findContours(diff_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Create annotated image (use img2 as base)
+            annotated_img = img2.copy()
+            
+            # Draw bounding boxes around changed regions
+            for contour in contours:
+                # Filter out very small contours
+                if cv2.contourArea(contour) > 100:  # Minimum area threshold
+                    x, y, w, h = cv2.boundingRect(contour)
+                    
+                    # Get image dimensions
+                    img_height, img_width = annotated_img.shape[:2]
+                    
+                    # Filter out rectangles that are too close to image borders
+                    # This prevents showing rectangles around the whole image
+                    border_threshold = 20  # pixels from edge
+                    
+                    # Check if rectangle is too close to any border
+                    if (x < border_threshold or 
+                        y < border_threshold or 
+                        x + w > img_width - border_threshold or 
+                        y + h > img_height - border_threshold):
+                        continue  # Skip this rectangle
+                    
+                    cv2.rectangle(annotated_img, (x, y), (x + w, y + h), (255, 0, 0), 10)  # Red rectangles
+            
+            # Create output directory if it doesn't exist
+            output_dir = Path("temp_diff")
+            output_dir.mkdir(exist_ok=True)
+            
+            # Save annotated image
+            diff_image_path = str(output_dir / "diff_result.jpg")
+            cv2.imwrite(diff_image_path, cv2.cvtColor(annotated_img, cv2.COLOR_RGB2BGR))
+            
+            logger.info(f"Difference visualization saved to: {diff_image_path}")
+            return diff_image_path
+            
+        except Exception as e:
+            logger.error(f"Failed to generate diff visualization: {e}")
+            return None
     
     def store_reference_image(self, image_data: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Store a reference image and compute its embedding"""
@@ -218,23 +254,19 @@ class ImageProvenanceService:
             
             # Compute CLIP embedding
             embedding = self._compute_clip_embedding(image)
-
-            # Ensure correct dtype and shape for FAISS
-            embedding = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
-            embedding_dim = embedding.shape[1]
-
+            
             # Add to FAISS index
-            self.index.add(embedding)
-
-            # Use FAISS ntotal to determine the index id (safer if index was manipulated)
-            index_id = int(self.index.ntotal) - 1
-            self.index_counter = int(self.index.ntotal)
+            self.index.add(embedding.reshape(1, -1))
+            
+            # Store metadata
+            index_id = self.index_counter
+            self.index_counter += 1
             
             image_metadata = {
                 "index_id": index_id,
                 "image_hash": image_hash,
                 "metadata": metadata or {},
-                "embedding_dim": embedding_dim,
+                "embedding_dim": len(embedding),
                 "original_image_data": image_data  # Store original for diff generation
             }
             
@@ -295,15 +327,10 @@ class ImageProvenanceService:
             embedding = self._compute_clip_embedding(image)
             
             # Search for similar images
-            embedding = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
-            k = min(5, int(self.index.ntotal))
-            similarities, indices = self.index.search(embedding, k=k)
-
-            # FAISS uses -1 for missing indices; handle that robustly
-            best_similarity = float(similarities[0][0]) if similarities.size and indices[0][0] != -1 else 0.0
-            best_index = int(indices[0][0]) if indices.size and indices[0][0] != -1 else -1
-
-            logger.debug(f"FAISS ntotal={self.index.ntotal}, k={k}, best_similarity={best_similarity}, best_index={best_index}")
+            similarities, indices = self.index.search(embedding.reshape(1, -1), k=min(5, self.index.ntotal))
+            
+            best_similarity = float(similarities[0][0])
+            best_index = int(indices[0][0])
             
             if best_similarity < self.similarity_threshold:
                 return {
@@ -317,18 +344,7 @@ class ImageProvenanceService:
                 }
             
             # Found similar image, compute SSIM
-            reference_metadata = self.image_metadata.get(best_index)
-
-            if best_index == -1 or reference_metadata is None:
-                return {
-                    "exact_match": False,
-                    "similarity": best_similarity,
-                    "ssim": 0.0,
-                    "verdict": "FAIL",
-                    "explanation": "No reference image metadata found for the nearest neighbor",
-                    "image_hash": image_hash,
-                    "diff_image_path": None
-                }
+            reference_metadata = self.image_metadata[best_index]
             reference_hash = reference_metadata["image_hash"]
             
             # Get original image data for SSIM computation
