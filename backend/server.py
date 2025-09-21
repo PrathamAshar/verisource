@@ -4,6 +4,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from fastapi import FastAPI, APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
@@ -27,10 +28,12 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
-mongo_url = os.environ['MONGO_URL']
+mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+db_name = os.environ.get('DB_NAME', 'verisource')
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-print(mongo_url)
+db = client[db_name]
+print(f"MongoDB URL: {mongo_url}")
+print(f"Database: {db_name}")
 
 # Create the main app without a prefix
 app = FastAPI(
@@ -495,6 +498,10 @@ cerebras_service = CerebrasAnalysisService()
 batching_service = BlockchainBatchingService()
 trust_calculator = TrustScoreCalculator()
 
+# Initialize provenance service with database connection
+from provenance import ImageProvenanceService
+provenance_service = ImageProvenanceService(db=db)
+
 # API Routes
 @api_router.post("/commit-image-direct")
 async def commit_single_image(media_sha256: str = Form(...)):
@@ -507,6 +514,10 @@ async def commit_single_image(media_sha256: str = Form(...)):
 @api_router.get("/")
 async def root():
     return {"message": "VeriSource API - Blockchain Media Verification"}
+
+@api_router.get("/capture")
+async def capture_get():
+    return {"message": "Use POST method to capture images", "method": "POST"}
 
 @api_router.post("/capture")
 async def capture_image(request: MediaCaptureRequest):
@@ -534,7 +545,29 @@ async def capture_image(request: MediaCaptureRequest):
         # Store receipt in database
         receipt_dict = receipt.dict()
         receipt_dict['c2pa_manifest'] = manifest
-        await db.receipts.insert_one(receipt_dict)
+        try:
+            await db.receipts.insert_one(receipt_dict)
+        except Exception as db_error:
+            logging.error(f"Database insert failed: {db_error}")
+            # Continue without database storage for now
+            pass
+        
+        # Also store in provenance database for future verification
+        try:
+            provenance_result = await provenance_service.store_reference_image(
+                request.image_data,
+                {
+                    "capture_method": "web_camera",
+                    "receipt_id": receipt.id,
+                    "blockchain_status": batch_status,
+                    "c2pa_manifest": manifest
+                }
+            )
+            logging.info(f"Image stored in provenance database: {provenance_result.get('status', 'unknown')}")
+        except Exception as provenance_error:
+            logging.error(f"Provenance storage failed: {provenance_error}")
+            # Continue without provenance storage
+            pass
         
         return {
             "status": "success",
@@ -550,7 +583,7 @@ async def capture_image(request: MediaCaptureRequest):
 
 @api_router.post("/verify")
 async def verify_image(request: MediaVerificationRequest):
-    """Verify image authenticity against blockchain"""
+    """Verify image authenticity against blockchain and provenance"""
     try:
         # Calculate image hash
         image_hash = image_processor.calculate_sha256(request.image_data)
@@ -565,19 +598,28 @@ async def verify_image(request: MediaVerificationRequest):
         if stored_receipt:
             c2pa_data = stored_receipt.get('c2pa_manifest', {})
         
-        # AI analysis
-        metadata = c2pa_data or {"capture_time": "unknown", "device_fingerprint": "unknown"}
-        ai_analysis = await cerebras_service.analyze_image_tamper(image_hash, metadata)
-        
-        # Calculate trust score
-        trust_score_result = trust_calculator.calculate_trust_score(
-            blockchain_verification, c2pa_data, ai_analysis
-        )
+        # If blockchain verification fails, try provenance verification
+        provenance_result = None
+        if not blockchain_verification.get("verified", False):
+            try:
+                provenance_result = await provenance_service.verify_image(request.image_data)
+                logging.info(f"Provenance verification completed: {provenance_result.get('verdict', 'UNKNOWN')}")
+            except Exception as provenance_error:
+                logging.error(f"Provenance verification failed: {provenance_error}")
+                provenance_result = {
+                    "verdict": "FAIL",
+                    "explanation": f"Provenance verification failed: {str(provenance_error)}",
+                    "similarity": 0.0,
+                    "ssim": 0.0,
+                    "exact_match": False,
+                    "matched_sha256": None,
+                    "diff_image_path": None
+                }
         
         return {
             "image_hash": image_hash,
             "blockchain_verification": blockchain_verification,
-            "trust_score_analysis": trust_score_result.model_dump(),
+            "provenance_verification": provenance_result,
             "receipt_found": bool(stored_receipt),
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
@@ -630,7 +672,7 @@ async def get_stats():
 async def store_reference_image(request: ProvenanceStoreRequest):
     """Store a reference image for provenance verification"""
     try:
-        result = provenance_service.store_reference_image(
+        result = await provenance_service.store_reference_image(
             request.image_data,
             request.metadata
         )
@@ -646,7 +688,7 @@ async def store_reference_image(request: ProvenanceStoreRequest):
 async def verify_image_provenance(request: ProvenanceVerifyRequest):
     """Verify image against stored reference images"""
     try:
-        result = provenance_service.verify_image(request.image_data)
+        result = await provenance_service.verify_image(request.image_data)
         return {
             "status": "success",
             "verification_result": result,
@@ -659,7 +701,7 @@ async def verify_image_provenance(request: ProvenanceVerifyRequest):
 async def get_provenance_stats():
     """Get provenance service statistics"""
     try:
-        stats = provenance_service.get_stats()
+        stats = await provenance_service.get_stats()
         return {
             "status": "success",
             "stats": stats,
@@ -672,7 +714,7 @@ async def get_provenance_stats():
 async def clear_provenance_references():
     """Clear all stored reference images"""
     try:
-        result = provenance_service.clear_all_references()
+        result = await provenance_service.clear_all_references()
         return {
             "status": "success",
             "result": result,
@@ -688,10 +730,17 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# Create temp_diff directory if it doesn't exist
+temp_diff_dir = Path("temp_diff")
+temp_diff_dir.mkdir(exist_ok=True)
+
+# Mount static files for serving difference images
+app.mount("/temp_diff", StaticFiles(directory="temp_diff"), name="temp_diff")
 
 # Configure logging
 logging.basicConfig(
@@ -719,4 +768,6 @@ async def periodic_batch_commit():
 # Start background task
 @app.on_event("startup")
 async def startup():
+    # Load provenance embeddings from MongoDB
+    await provenance_service._load_embeddings_from_db()
     asyncio.create_task(periodic_batch_commit())

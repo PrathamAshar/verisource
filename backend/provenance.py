@@ -15,6 +15,7 @@ import logging
 from typing import Dict, Any, Optional, Tuple, List
 from io import BytesIO
 from pathlib import Path
+from datetime import datetime, timezone
 
 import torch
 import torchvision.transforms as transforms
@@ -27,27 +28,32 @@ import cv2
 import matplotlib.pyplot as plt
 import os
 from pathlib import Path
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
 
 logger = logging.getLogger(__name__)
 
 class ImageProvenanceService:
     """Service for image provenance verification using CLIP embeddings and SSIM"""
     
-    def __init__(self):
+    def __init__(self, db=None):
         self.model = None
         self.processor = None
         self.index = None
-        self.image_metadata = {}  # Maps index IDs to image metadata
-        self.sha256_to_index = {}  # Maps SHA-256 to index ID
+        self.image_metadata = {}  # Maps FAISS index IDs to MongoDB record IDs
+        self.sha256_to_index = {}  # Maps SHA-256 to FAISS index ID
         self.index_counter = 0
         self.similarity_threshold = 0.85  # Threshold for considering images similar
         self.ssim_threshold = 0.80  # Threshold for SSIM similarity
+        self.db = db  # MongoDB database connection
         
         # Initialize CLIP model
         self._initialize_clip_model()
         
         # Initialize FAISS index
         self._initialize_faiss_index()
+        
+        # Note: MongoDB loading will be done during server startup
     
     def _initialize_clip_model(self):
         """Initialize CLIP model and processor"""
@@ -80,6 +86,48 @@ class ImageProvenanceService:
         except Exception as e:
             logger.error(f"Failed to initialize FAISS index: {e}")
             raise
+    
+    async def _load_embeddings_from_db(self):
+        """Load all embeddings from MongoDB and rebuild FAISS index"""
+        try:
+            if self.db is None:
+                logger.warning("No database connection available for loading embeddings")
+                return
+                
+            logger.info("Loading embeddings from MongoDB...")
+            
+            # Get all image references from MongoDB
+            cursor = self.db.image_references.find({})
+            embeddings_data = await cursor.to_list(length=None)
+            
+            if not embeddings_data:
+                logger.info("No existing embeddings found in MongoDB")
+                return
+            
+            # Rebuild FAISS index and mappings
+            embeddings = []
+            for record in embeddings_data:
+                embedding = np.array(record['embedding'], dtype=np.float32)
+                embeddings.append(embedding)
+                
+                # Update mappings
+                faiss_id = self.index_counter
+                self.index_counter += 1
+                
+                # Store ObjectId as string for later conversion
+                self.image_metadata[faiss_id] = str(record['_id'])
+                self.sha256_to_index[record['sha256']] = faiss_id
+                logger.info(f"Loaded embedding {faiss_id} for SHA256 {record['sha256'][:16]}...")
+            
+            # Add all embeddings to FAISS index
+            if embeddings:
+                embeddings_array = np.vstack(embeddings)
+                self.index.add(embeddings_array)
+                logger.info(f"Loaded {len(embeddings)} embeddings from MongoDB into FAISS index")
+            
+        except Exception as e:
+            logger.error(f"Failed to load embeddings from MongoDB: {e}")
+            # Don't raise - allow service to continue with empty index
     
     def _preprocess_image(self, image_data: str) -> Image.Image:
         """Preprocess image data for CLIP processing"""
@@ -139,19 +187,19 @@ class ImageProvenanceService:
     def _compute_ssim(self, image1_data: str, image2_data: str) -> Tuple[float, Optional[str]]:
         """Compute SSIM between two images and generate difference map"""
         try:
-            print(f"DEBUG: Starting SSIM computation...")
+            logger.info("Starting SSIM computation...")
             
             # Preprocess both images
             img1 = self._preprocess_image(image1_data)
             img2 = self._preprocess_image(image2_data)
             
-            print(f"DEBUG: Image 1 size: {img1.size}, Image 2 size: {img2.size}")
+            logger.info(f"Image 1 size: {img1.size}, Image 2 size: {img2.size}")
             
             # Convert PIL images to numpy arrays
             img1_np = np.array(img1)
             img2_np = np.array(img2)
             
-            print(f"DEBUG: Array 1 shape: {img1_np.shape}, Array 2 shape: {img2_np.shape}")
+            logger.info(f"Array 1 shape: {img1_np.shape}, Array 2 shape: {img2_np.shape}")
             
             # Resize images to same size if different
             if img1_np.shape != img2_np.shape:
@@ -161,93 +209,110 @@ class ImageProvenanceService:
                 
                 img1_np = cv2.resize(img1_np, (min_width, min_height))
                 img2_np = cv2.resize(img2_np, (min_width, min_height))
+                logger.info(f"Resized images to: {img1_np.shape}")
+            
+            # Normalize images to reduce global differences
+            img1_np = img1_np.astype(np.float32)
+            img2_np = img2_np.astype(np.float32)
+            
+            # Apply histogram equalization to reduce brightness/contrast differences
+            if len(img1_np.shape) == 3:
+                # Convert to LAB color space for better normalization
+                img1_lab = cv2.cvtColor(img1_np.astype(np.uint8), cv2.COLOR_RGB2LAB)
+                img2_lab = cv2.cvtColor(img2_np.astype(np.uint8), cv2.COLOR_RGB2LAB)
+                
+                # Apply histogram equalization to L channel only
+                img1_lab[:,:,0] = cv2.equalizeHist(img1_lab[:,:,0])
+                img2_lab[:,:,0] = cv2.equalizeHist(img2_lab[:,:,0])
+                
+                # Convert back to RGB
+                img1_np = cv2.cvtColor(img1_lab, cv2.COLOR_LAB2RGB).astype(np.float32)
+                img2_np = cv2.cvtColor(img2_lab, cv2.COLOR_LAB2RGB).astype(np.float32)
             
             # Convert to grayscale for SSIM
             if len(img1_np.shape) == 3:
-                img1_gray = cv2.cvtColor(img1_np, cv2.COLOR_RGB2GRAY)
-                img2_gray = cv2.cvtColor(img2_np, cv2.COLOR_RGB2GRAY)
+                img1_gray = cv2.cvtColor(img1_np.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+                img2_gray = cv2.cvtColor(img2_np.astype(np.uint8), cv2.COLOR_RGB2GRAY)
             else:
-                img1_gray = img1_np
-                img2_gray = img2_np
+                img1_gray = img1_np.astype(np.uint8)
+                img2_gray = img2_np.astype(np.uint8)
             
             # Compute SSIM with full=True to get difference map
             ssim_score, diff_map = ssim(img1_gray, img2_gray, data_range=255, full=True)
+            logger.info(f"SSIM score: {ssim_score:.3f}")
             
             # Generate difference visualization
-            diff_image_path = self._generate_diff_visualization(img1_np, img2_np, diff_map)
+            diff_image_path = self._generate_diff_visualization(img1_np.astype(np.uint8), img2_np.astype(np.uint8), diff_map)
             
             return float(ssim_score), diff_image_path
             
         except Exception as e:
             logger.error(f"Failed to compute SSIM: {e}")
+            import traceback
+            traceback.print_exc()
             return 0.0, None
     
     def _generate_diff_visualization(self, img1: np.ndarray, img2: np.ndarray, diff_map: np.ndarray) -> str:
         """Generate difference visualization with bounding boxes"""
         try:
-            # Convert difference map to binary mask
-            # SSIM diff map: 0 = identical, 1 = completely different
-            threshold = 0.1  # Adjust threshold as needed
-            diff_binary = (diff_map > threshold).astype(np.uint8) * 255
-            
-            # Find contours of changed regions
+            logger.info("Generating difference visualization...")
+
+            # SSIM diff_map: values close to 1 = similar, lower = different
+            # So we flip the condition: highlight where SSIM < threshold
+            threshold = 0.75
+            diff_binary = (diff_map < threshold).astype(np.uint8) * 255
+
+            # Clean up mask
+            kernel = np.ones((3, 3), np.uint8)
+            diff_binary = cv2.morphologyEx(diff_binary, cv2.MORPH_CLOSE, kernel)
+            diff_binary = cv2.morphologyEx(diff_binary, cv2.MORPH_OPEN, kernel)
+
+            # Find contours
             contours, _ = cv2.findContours(diff_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Create annotated image (use img2 as base)
+            logger.info(f"Found {len(contours)} contours")
+
             annotated_img = img2.copy()
-            
-            # Draw bounding boxes around changed regions
+            img_height, img_width = annotated_img.shape[:2]
+            total_area = img_height * img_width
+            rectangles_drawn = 0
+
             for contour in contours:
-                # Filter out very small contours
-                if cv2.contourArea(contour) > 100:  # Minimum area threshold
+                area = cv2.contourArea(contour)
+                if 20 < area < (total_area * 0.95):  # allow broader range
                     x, y, w, h = cv2.boundingRect(contour)
-                    
-                    # Get image dimensions
-                    img_height, img_width = annotated_img.shape[:2]
-                    
-                    # Filter out rectangles that are too close to image borders
-                    # This prevents showing rectangles around the whole image
-                    border_threshold = 20  # pixels from edge
-                    
-                    # Check if rectangle is too close to any border
-                    if (x < border_threshold or 
-                        y < border_threshold or 
-                        x + w > img_width - border_threshold or 
-                        y + h > img_height - border_threshold):
-                        continue  # Skip this rectangle
-                    
-                    cv2.rectangle(annotated_img, (x, y), (x + w, y + h), (255, 0, 0), 10)  # Red rectangles
-            
-            # Create output directory if it doesn't exist
+                    # Draw red rectangle
+                    cv2.rectangle(annotated_img, (x, y), (x + w, y + h), (0, 0, 255), 12)
+                    rectangles_drawn += 1
+
+            logger.info(f"Drew {rectangles_drawn} rectangles")
+
+            # Save annotated image
             output_dir = Path("temp_diff")
             output_dir.mkdir(exist_ok=True)
-            
-            # Save annotated image
             diff_image_path = str(output_dir / "diff_result.jpg")
             cv2.imwrite(diff_image_path, cv2.cvtColor(annotated_img, cv2.COLOR_RGB2BGR))
-            
-            logger.info(f"Difference visualization saved to: {diff_image_path}")
+
             return diff_image_path
-            
         except Exception as e:
             logger.error(f"Failed to generate diff visualization: {e}")
             return None
     
-    def store_reference_image(self, image_data: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def store_reference_image(self, image_data: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Store a reference image and compute its embedding"""
         try:
             # Compute SHA-256
             image_hash = self._compute_sha256(image_data)
             
-            # Check if image already exists
-            if image_hash in self.sha256_to_index:
-                index_id = self.sha256_to_index[image_hash]
-                return {
-                    "status": "already_exists",
-                    "image_hash": image_hash,
-                    "index_id": index_id,
-                    "message": "Image already stored as reference"
-                }
+            # Check if image already exists in MongoDB
+            if self.db is not None:
+                existing_record = await self.db.image_references.find_one({"sha256": image_hash})
+                if existing_record:
+                    return {
+                        "status": "already_exists",
+                        "image_hash": image_hash,
+                        "mongo_id": str(existing_record['_id']),
+                        "message": "Image already stored as reference"
+                    }
             
             # Preprocess image
             image = self._preprocess_image(image_data)
@@ -255,30 +320,39 @@ class ImageProvenanceService:
             # Compute CLIP embedding
             embedding = self._compute_clip_embedding(image)
             
-            # Add to FAISS index
-            self.index.add(embedding.reshape(1, -1))
+            # Store in MongoDB
+            mongo_record = {
+                "sha256": image_hash,
+                "embedding": embedding.tolist(),  # Convert to list for MongoDB storage
+                "c2pa_manifest": metadata or {},
+                "original_image_data": image_data,  # Store original for diff generation
+                "created_at": datetime.now(timezone.utc)
+            }
+            logger.info(f"Storing MongoDB record with original_image_data length: {len(image_data)}")
             
-            # Store metadata
-            index_id = self.index_counter
+            if self.db is not None:
+                result = await self.db.image_references.insert_one(mongo_record)
+                mongo_id = str(result.inserted_id)
+            else:
+                mongo_id = "no_db"
+            
+            # Add to FAISS index
+            faiss_id = self.index_counter
             self.index_counter += 1
             
-            image_metadata = {
-                "index_id": index_id,
-                "image_hash": image_hash,
-                "metadata": metadata or {},
-                "embedding_dim": len(embedding),
-                "original_image_data": image_data  # Store original for diff generation
-            }
+            self.index.add(embedding.reshape(1, -1))
             
-            self.image_metadata[index_id] = image_metadata
-            self.sha256_to_index[image_hash] = index_id
+            # Update mappings
+            self.image_metadata[faiss_id] = mongo_id
+            self.sha256_to_index[image_hash] = faiss_id
             
-            logger.info(f"Stored reference image with hash {image_hash} and index {index_id}")
+            logger.info(f"Stored reference image with hash {image_hash}, FAISS ID {faiss_id}, MongoDB ID {mongo_id}")
             
             return {
                 "status": "stored",
                 "image_hash": image_hash,
-                "index_id": index_id,
+                "faiss_id": faiss_id,
+                "mongo_id": mongo_id,
                 "embedding_dim": len(embedding),
                 "message": "Reference image stored successfully"
             }
@@ -287,28 +361,28 @@ class ImageProvenanceService:
             logger.error(f"Failed to store reference image: {e}")
             raise
     
-    def verify_image(self, image_data: str) -> Dict[str, Any]:
+    async def verify_image(self, image_data: str) -> Dict[str, Any]:
         """Verify an image against stored reference images"""
         try:
             # Compute SHA-256
             image_hash = self._compute_sha256(image_data)
             
-            # Check for exact match first
-            if image_hash in self.sha256_to_index:
-                index_id = self.sha256_to_index[image_hash]
-                metadata = self.image_metadata[index_id]
-                
-                return {
-                    "exact_match": True,
-                    "similarity": 1.0,
-                    "ssim": 1.0,
-                    "verdict": "PASS",
-                    "explanation": "Exact match found - this is the original authentic image",
-                    "image_hash": image_hash,
-                    "reference_index_id": index_id,
-                    "reference_metadata": metadata,
-                    "diff_image_path": None
-                }
+            # Check for exact match in MongoDB first
+            matched_sha256 = None
+            if self.db is not None:
+                exact_match_record = await self.db.image_references.find_one({"sha256": image_hash})
+                if exact_match_record:
+                    matched_sha256 = image_hash
+                    return {
+                        "exact_match": True,
+                        "similarity": 1.0,
+                        "ssim": 1.0,
+                        "verdict": "PASS",
+                        "explanation": "Exact match found - this is the original authentic image",
+                        "image_hash": image_hash,
+                        "matched_sha256": matched_sha256,
+                        "diff_image_path": None
+                    }
             
             # No exact match, check for perceptual similarity
             if self.index.ntotal == 0:
@@ -319,6 +393,7 @@ class ImageProvenanceService:
                     "verdict": "FAIL",
                     "explanation": "No reference images stored for comparison",
                     "image_hash": image_hash,
+                    "matched_sha256": None,
                     "diff_image_path": None
                 }
             
@@ -330,7 +405,7 @@ class ImageProvenanceService:
             similarities, indices = self.index.search(embedding.reshape(1, -1), k=min(5, self.index.ntotal))
             
             best_similarity = float(similarities[0][0])
-            best_index = int(indices[0][0])
+            best_faiss_id = int(indices[0][0])
             
             if best_similarity < self.similarity_threshold:
                 return {
@@ -340,23 +415,42 @@ class ImageProvenanceService:
                     "verdict": "FAIL",
                     "explanation": f"No similar images found (similarity: {best_similarity:.3f} < {self.similarity_threshold})",
                     "image_hash": image_hash,
+                    "matched_sha256": None,
                     "diff_image_path": None
                 }
             
-            # Found similar image, compute SSIM
-            reference_metadata = self.image_metadata[best_index]
-            reference_hash = reference_metadata["image_hash"]
+            # Found similar image, get MongoDB record
+            mongo_id = self.image_metadata.get(best_faiss_id)
+            reference_record = None
+            if self.db is not None and mongo_id:
+                try:
+                    # Convert string to ObjectId for MongoDB query
+                    object_id = ObjectId(mongo_id)
+                    reference_record = await self.db.image_references.find_one({"_id": object_id})
+                    if reference_record:
+                        matched_sha256 = reference_record["sha256"]
+                        logger.info(f"Found MongoDB record for FAISS ID {best_faiss_id}: {matched_sha256[:16]}...")
+                    else:
+                        logger.warning(f"No MongoDB record found for FAISS ID {best_faiss_id}, mongo_id: {mongo_id}")
+                except Exception as e:
+                    logger.error(f"Error querying MongoDB record: {e}")
+            else:
+                logger.warning(f"No MongoDB connection or mongo_id for FAISS ID {best_faiss_id}")
             
             # Get original image data for SSIM computation
-            reference_image_data = reference_metadata.get("original_image_data")
+            reference_image_data = None
+            if reference_record:
+                reference_image_data = reference_record.get("original_image_data")
             
             if reference_image_data:
                 # Compute actual SSIM and generate diff
                 actual_ssim, diff_image_path = self._compute_ssim(reference_image_data, image_data)
+                logger.info(f"SSIM computation: score={actual_ssim}, diff_path={diff_image_path}")
             else:
                 # Fallback: estimate SSIM based on similarity
                 actual_ssim = min(best_similarity * 0.9, 0.95)  # Conservative estimate
                 diff_image_path = None
+                logger.warning("No reference image data available for SSIM computation")
             
             # Determine verdict based on similarity and SSIM
             if actual_ssim == 0.0 and best_similarity >= self.similarity_threshold:
@@ -368,10 +462,18 @@ class ImageProvenanceService:
                 # High SSIM - likely minor modifications
                 verdict = "NEAR_DUPLICATE"
                 explanation = f"This appears to be a modified version of a stored authentic image (similarity: {best_similarity:.3f})"
-            elif best_similarity >= 0.95:
+            elif best_similarity >= 0.90 and actual_ssim < 0.50:
+                # High similarity but very low SSIM - likely a cropped version
+                verdict = "NEAR_DUPLICATE"
+                explanation = f"This appears to be a cropped version of the original image (similarity: {best_similarity:.3f}, SSIM: {actual_ssim:.3f})"
+            elif best_similarity >= 0.93 and actual_ssim < 0.60:
+                # Very high similarity but low SSIM - likely a cropped version
+                verdict = "NEAR_DUPLICATE"
+                explanation = f"This appears to be a cropped version of the original image (similarity: {best_similarity:.3f}, SSIM: {actual_ssim:.3f})"
+            elif best_similarity >= 0.95 and actual_ssim < 0.70:
                 # Very high similarity but lower SSIM - likely cropping or major structural changes
                 verdict = "NEAR_DUPLICATE"
-                explanation = f"This appears to be a cropped or structurally modified version of a stored authentic image (similarity: {best_similarity:.3f}, SSIM: {actual_ssim:.3f})"
+                explanation = f"This appears to be a cropped version of the original image (similarity: {best_similarity:.3f}, SSIM: {actual_ssim:.3f})"
             else:
                 # Low similarity - likely different image
                 verdict = "FAIL"
@@ -384,35 +486,37 @@ class ImageProvenanceService:
                 "verdict": verdict,
                 "explanation": explanation,
                 "image_hash": image_hash,
-                "reference_index_id": best_index,
-                "reference_metadata": reference_metadata,
-                "diff_image_path": diff_image_path,
-                "similar_images": [
-                    {
-                        "index_id": int(indices[0][i]),
-                        "similarity": float(similarities[0][i]),
-                        "metadata": self.image_metadata[int(indices[0][i])]
-                    }
-                    for i in range(len(indices[0]))
-                ]
+                "matched_sha256": matched_sha256,
+                "diff_image_path": diff_image_path
             }
             
         except Exception as e:
             logger.error(f"Failed to verify image: {e}")
             raise
     
-    def get_stats(self) -> Dict[str, Any]:
+    async def get_stats(self) -> Dict[str, Any]:
         """Get statistics about stored images"""
+        mongo_count = 0
+        if self.db is not None:
+            mongo_count = await self.db.image_references.count_documents({})
+        
         return {
             "total_reference_images": self.index.ntotal,
+            "mongo_reference_images": mongo_count,
             "similarity_threshold": self.similarity_threshold,
             "ssim_threshold": self.ssim_threshold,
             "embedding_dimension": 512,
             "model_name": "openai/clip-vit-base-patch32"
         }
     
-    def clear_all_references(self) -> Dict[str, Any]:
+    async def clear_all_references(self) -> Dict[str, Any]:
         """Clear all stored reference images"""
+        # Clear MongoDB
+        if self.db is not None:
+            result = await self.db.image_references.delete_many({})
+            logger.info(f"Cleared {result.deleted_count} records from MongoDB")
+        
+        # Clear FAISS index and mappings
         self.index.reset()
         self.image_metadata.clear()
         self.sha256_to_index.clear()
@@ -421,5 +525,5 @@ class ImageProvenanceService:
         logger.info("Cleared all reference images")
         return {"message": "All reference images cleared successfully"}
 
-# Global instance
-provenance_service = ImageProvenanceService()
+# Global instance - will be initialized with database connection
+provenance_service = None

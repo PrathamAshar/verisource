@@ -129,119 +129,173 @@ const CameraCapture = ({ onImageCaptured, isCapturing, setIsCapturing }) => {
   );
 };
 
-// Trust Score Display Component
-const TrustScoreDisplay = ({ trustScore, analysis }) => {
-  const getScoreColor = (score) => {
-    if (score >= 80) return 'text-green-600 bg-green-50 border-green-200';
-    if (score >= 60) return 'text-yellow-600 bg-yellow-50 border-yellow-200';
-    if (score >= 40) return 'text-orange-600 bg-orange-50 border-orange-200';
-    return 'text-red-600 bg-red-50 border-red-200';
-  };
-
+// Provenance Display Component
+const ProvenanceDisplay = ({ blockchainVerification, provenanceVerification }) => {
   const getVerdictIcon = (verdict) => {
     switch (verdict) {
-      case 'HIGHLY_AUTHENTIC':
+      case 'PASS':
         return <CheckCircle className="h-5 w-5 text-green-600" />;
-      case 'LIKELY_AUTHENTIC':
-        return <CheckCircle className="h-5 w-5 text-green-500" />;
-      case 'UNCERTAIN':
+      case 'NEAR_DUPLICATE':
         return <AlertTriangle className="h-5 w-5 text-yellow-500" />;
-      default:
+      case 'FAIL':
         return <AlertTriangle className="h-5 w-5 text-red-500" />;
+      default:
+        return <AlertTriangle className="h-5 w-5 text-gray-500" />;
     }
   };
 
-  if (!analysis) return null;
+  const getVerdictColor = (verdict) => {
+    switch (verdict) {
+      case 'PASS':
+        return 'text-green-600 bg-green-50 border-green-200';
+      case 'NEAR_DUPLICATE':
+        return 'text-yellow-600 bg-yellow-50 border-yellow-200';
+      case 'FAIL':
+        return 'text-red-600 bg-red-50 border-red-200';
+      default:
+        return 'text-gray-600 bg-gray-50 border-gray-200';
+    }
+  };
 
+  // If blockchain verification succeeded, show that
+  if (blockchainVerification?.verified) {
+    return (
+      <Card className="w-full">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Shield className="h-5 w-5" />
+            Blockchain Verification
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="p-6 rounded-lg border-2 text-green-600 bg-green-50 border-green-200">
+            <div className="flex items-center gap-2 mb-2">
+              <CheckCircle className="h-5 w-5" />
+              <span className="font-semibold">VERIFIED ON BLOCKCHAIN</span>
+            </div>
+            <p className="text-sm opacity-75">
+              This image hash was found on the blockchain and is authentic.
+            </p>
+            <div className="mt-3 text-xs">
+              <p><strong>Transaction:</strong> {blockchainVerification.transaction_hash}</p>
+              <p><strong>Block:</strong> {blockchainVerification.block_number}</p>
+              <p><strong>Batch ID:</strong> {blockchainVerification.batch_id}</p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  // If blockchain verification failed but we have provenance results
+  if (provenanceVerification) {
+    return (
+      <Card className="w-full">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Shield className="h-5 w-5" />
+            Provenance Analysis
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Main Result */}
+          <div className={`p-6 rounded-lg border-2 ${getVerdictColor(provenanceVerification.verdict)}`}>
+            <div className="flex items-center gap-2 mb-2">
+              {getVerdictIcon(provenanceVerification.verdict)}
+              <span className="font-semibold">
+                {provenanceVerification.verdict.replace('_', ' ')}
+              </span>
+            </div>
+            <p className="text-sm opacity-75 mb-3">
+              {provenanceVerification.explanation}
+            </p>
+            
+            {/* Detailed Metrics */}
+            <div className="grid grid-cols-2 gap-4 text-xs">
+              <div>
+                <strong>Similarity Score:</strong> {(provenanceVerification.similarity * 100).toFixed(1)}%
+              </div>
+              <div>
+                <strong>SSIM Score:</strong> {(provenanceVerification.ssim * 100).toFixed(1)}%
+              </div>
+              <div>
+                <strong>Exact Match:</strong> {provenanceVerification.exact_match ? 'Yes' : 'No'}
+              </div>
+              <div>
+                <strong>Image Hash:</strong> {provenanceVerification.image_hash?.substring(0, 16)}...
+              </div>
+            </div>
+          </div>
+
+          {/* Difference Image Display */}
+          {provenanceVerification.diff_image_path && (
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-sm">Difference Analysis</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="text-sm text-gray-600 mb-3">
+                  Red rectangles highlight areas where modifications were detected:
+                </p>
+                <div className="border rounded-lg p-2 bg-gray-50">
+                  <img 
+                    src={`http://localhost:8000/temp_diff/diff_result.jpg`}
+                    alt="Difference analysis"
+                    className="max-w-full h-auto rounded"
+                    onError={(e) => {
+                      e.target.style.display = 'none';
+                      e.target.nextSibling.style.display = 'block';
+                    }}
+                  />
+                  <div style={{display: 'none'}} className="text-center text-gray-500 py-4">
+                    Difference image not available
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Similar Images */}
+          {provenanceVerification.similar_images && provenanceVerification.similar_images.length > 0 && (
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="text-sm">Similar Images Found</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-2">
+                  {provenanceVerification.similar_images.slice(0, 3).map((img, index) => (
+                    <div key={index} className="flex justify-between items-center p-2 bg-gray-50 rounded">
+                      <span className="text-sm">Reference #{img.index_id}</span>
+                      <Badge variant="outline">{(img.similarity * 100).toFixed(1)}%</Badge>
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+        </CardContent>
+      </Card>
+    );
+  }
+
+  // If neither blockchain nor provenance verification worked
   return (
     <Card className="w-full">
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
-          <Award className="h-5 w-5" />
-          Trust Score Analysis
+          <Shield className="h-5 w-5" />
+          Verification Results
         </CardTitle>
       </CardHeader>
-      <CardContent className="space-y-6">
-        {/* Overall Score */}
-        <div className={`p-6 rounded-lg border-2 ${getScoreColor(trustScore)}`}>
-          <div className="flex items-center justify-between mb-2">
-            <div className="flex items-center gap-2">
-              {getVerdictIcon(analysis.overall_verdict)}
-              <span className="font-semibold">
-                {analysis.overall_verdict.replace('_', ' ')}
-              </span>
-            </div>
-            <div className="text-2xl font-bold">{Math.round(trustScore)}/100</div>
+      <CardContent>
+        <div className="p-6 rounded-lg border-2 text-red-600 bg-red-50 border-red-200">
+          <div className="flex items-center gap-2 mb-2">
+            <AlertTriangle className="h-5 w-5" />
+            <span className="font-semibold">NOT VERIFIED</span>
           </div>
-          <Progress value={trustScore} className="mb-2" />
-          <p className="text-sm opacity-75">{analysis.explanation}</p>
-        </div>
-
-        {/* Detailed Breakdown */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="text-sm">Blockchain Provenance</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="flex justify-between items-center mb-2">
-                <span className="text-sm">Score</span>
-                <Badge variant="outline">{analysis.blockchain_provenance.score}/40</Badge>
-              </div>
-              <Progress value={(analysis.blockchain_provenance.score / 40) * 100} className="mb-2" />
-              <p className="text-xs text-gray-600">
-                {analysis.blockchain_provenance.verified ? 'Hash verified on blockchain' : 'Hash not found on blockchain'}
-              </p>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="text-sm">C2PA Integrity</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="flex justify-between items-center mb-2">
-                <span className="text-sm">Score</span>
-                <Badge variant="outline">{analysis.c2pa_integrity.score}/25</Badge>
-              </div>
-              <Progress value={(analysis.c2pa_integrity.score / 25) * 100} className="mb-2" />
-              <p className="text-xs text-gray-600">
-                {analysis.c2pa_integrity.manifest_present ? 'Manifest present and valid' : 'No manifest found'}
-              </p>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="text-sm">AI Tamper Analysis</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="flex justify-between items-center mb-2">
-                <span className="text-sm">Score</span>
-                <Badge variant="outline">{Math.round(analysis.ai_tamper_analysis.score)}/25</Badge>
-              </div>
-              <Progress value={(analysis.ai_tamper_analysis.score / 25) * 100} className="mb-2" />
-              <p className="text-xs text-gray-600">
-                {Math.round(analysis.ai_tamper_analysis.tamper_probability)}% tamper probability
-              </p>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="text-sm">Derivative Analysis</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="flex justify-between items-center mb-2">
-                <span className="text-sm">Score</span>
-                <Badge variant="outline">{analysis.derivative_analysis.score}/10</Badge>
-              </div>
-              <Progress value={(analysis.derivative_analysis.score / 10) * 100} className="mb-2" />
-              <p className="text-xs text-gray-600">
-                {analysis.derivative_analysis.analysis}
-              </p>
-            </CardContent>
-          </Card>
+          <p className="text-sm opacity-75">
+            This image was not found on the blockchain and no similar reference images were found for provenance analysis.
+          </p>
         </div>
       </CardContent>
     </Card>
@@ -577,9 +631,9 @@ const VerifyTab = () => {
                     </CardContent>
                   </Card>
 
-                  <TrustScoreDisplay 
-                    trustScore={verificationResult.trust_score_analysis.trust_score}
-                    analysis={verificationResult.trust_score_analysis}
+                  <ProvenanceDisplay 
+                    blockchainVerification={verificationResult.blockchain_verification}
+                    provenanceVerification={verificationResult.provenance_verification}
                   />
                 </div>
               )}
