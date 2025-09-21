@@ -1,0 +1,62 @@
+[
+  {
+    "id": "tweet_001",
+    "username": "sports_fan_99",
+    "text": "Just watched the most incredible World Cup match! The final goal in overtime was absolutely breathtaking. What a tournament this has been!",
+    "image": "https://example.com/worldcup_goal.jpg"
+  },
+  {
+    "id": "tweet_002", 
+    "username": "food_lover_23",
+    "text": "Made the most delicious homemade pasta today. The secret is in the fresh basil and extra virgin olive oil. Recipe coming soon!",
+    "image": null
+  },
+  {
+    "id": "tweet_003",
+    "username": "tech_news_blog",
+    "text": "Breaking: Major tech company announces revolutionary AI breakthrough that could change everything. Full details at our website.",
+    "image": "https://example.com/ai_breakthrough.jpg"
+  },
+  {
+    "id": "tweet_004",
+    "username": "worldcup_official",
+    "text": "Congratulations to the champions! What an amazing World Cup tournament. Thank you to all the fans and players for making this unforgettable.",
+    "image": "https://example.com/champions_celebration.jpg"
+  },
+  {
+    "id": "tweet_005",
+    "username": "weather_update",
+    "text": "Severe weather warning issued for the tri-state area. Heavy rains and strong winds expected tonight. Stay safe everyone!",
+    "image": null
+  },
+  {
+    "id": "tweet_006",
+    "username": "football_analyst",
+    "text": "The World Cup final analysis: Team strategy, player performance, and what this means for the future of international football.",
+    "image": "https://example.com/analysis_chart.jpg"
+  },
+  {
+    "id": "tweet_007",
+    "username": "travel_diary",
+    "text": "Just arrived in Paris! The Eiffel Tower looks even more beautiful at sunset. Can't wait to explore this amazing city.",
+    "image": "https://example.com/paris_sunset.jpg"
+  },
+  {
+    "id": "tweet_008",
+    "username": "sports_reporter",
+    "text": "World Cup statistics: Most goals scored, best saves, and incredible moments that defined this tournament. Data visualization coming up!",
+    "image": null
+  },
+  {
+    "id": "tweet_009",
+    "username": "crypto_trader",
+    "text": "Bitcoin hits new all-time high! The market is showing incredible strength. Time to analyze the charts and plan next moves.",
+    "image": "https://example.com/bitcoin_chart.jpg"
+  },
+  {
+    "id": "tweet_010",
+    "username": "worldcup_fan",
+    "text": "Still can't believe what we witnessed in the World Cup final! The passion, the drama, the pure emotion. Football is truly the beautiful game.",
+    "image": "https://example.com/final_moment.jpg"
+  }
+]
