@@ -1,5 +1,5 @@
-#VeriSource
-###PennApps 2025 Submission by Aarav Agarwal, Aditya Agarwal, and Pratham Ashar
+# VeriSource
+### PennApps 2025 Submission by Aarav Agarwal, Aditya Agarwal, and Pratham Ashar
 
 ## Inspiration
 
